@@ -19,7 +19,7 @@ except:
 # ============================================================
 #  🔐 API KEY (YOU MUST REPLACE THIS IN YOUR LOCAL CODE)
 # ============================================================
-API_KEY = "YOUR_API_KEY_HERE"   # <-- paste your API key here manually
+API_KEY = "AIzaSyAtX1QJdv-y5xasT3elZ-fqQiPZUT8kwpY"   # <-- paste your API key here manually
 
 
 # ============================================================
