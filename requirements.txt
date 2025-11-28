@@ -1,0 +1,10 @@
+streamlit
+mne
+numpy
+scipy
+tensorflow
+shap
+matplotlib
+einops
+google-generativeai
+protobuf==3.20.*
