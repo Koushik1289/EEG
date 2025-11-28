@@ -2,8 +2,9 @@ streamlit
 numpy
 scipy
 mne
-einops
-matplotlib
 onnxruntime
+matplotlib
+pandas
+einops
 google-generativeai
 protobuf>=4.23.4
