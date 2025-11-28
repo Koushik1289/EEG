@@ -1,117 +1,192 @@
+import os
+from io import BytesIO
 import streamlit as st
 import numpy as np
 import mne
 from scipy.signal import welch
-import tensorflow as tf
-import shap
-import matplotlib.pyplot as plt
-from io import BytesIO
+import onnxruntime as ort
 from einops import rearrange
+import matplotlib.pyplot as plt
 
-# -------------------------------------------------------
-# 1) STREAMLIT UI
-# -------------------------------------------------------
-st.title("EEG → PSD → Residual BiLSTM → Seq2Seq → Agentic AI")
-st.write("Upload EEG (.edf) file and run complete pipeline")
+# Optional Google Generative AI (agentic)
+try:
+    import google.generativeai as genai
+    HAS_GENAI = True
+except:
+    HAS_GENAI = False
 
-uploaded = st.file_uploader("Upload .edf EEG file", type=["edf"])
 
-# -------------------------------------------------------
-# 2) Function: extract EEG & compute PSD
-# -------------------------------------------------------
-def compute_psd(eeg, sfreq):
+# ============================================================
+#  🔐 API KEY (YOU MUST REPLACE THIS IN YOUR LOCAL CODE)
+# ============================================================
+API_KEY = "YOUR_API_KEY_HERE"   # <-- paste your API key here manually
+
+
+# ============================================================
+# Streamlit UI settings
+# ============================================================
+st.set_page_config(page_title="EEG → ONNX → Agentic AI", layout="wide")
+st.title("🧠 EEG → PSD → Encoder (ONNX/Fallback) → Decoder (ONNX/Fallback) → Agentic AI")
+st.markdown("Upload a `.edf` file and run the entire EEG → PSD → Seq2Seq pipeline.")
+
+
+# ============================================================
+# Helper Functions
+# ============================================================
+def read_edf_bytes(file_bytes):
+    raw = mne.io.read_raw_edf(BytesIO(file_bytes), preload=True, verbose=False)
+    return raw.get_data(), raw.info["sfreq"], raw.info["ch_names"]
+
+
+def compute_psd(eeg, sfreq, nperseg=512):
     psd_list = []
     for ch in eeg:
-        f, pxx = welch(ch, sfreq, nperseg=512)
+        f, pxx = welch(ch, fs=sfreq, nperseg=nperseg)
         psd_list.append(pxx)
     return np.array(psd_list), f
 
-# -------------------------------------------------------
-# 3) Residual BiLSTM model (example architecture)
-# -------------------------------------------------------
-def build_residual_bilstm(input_shape):
-    inp = tf.keras.Input(shape=input_shape)
-    x = tf.keras.layers.Bidirectional(tf.keras.layers.LSTM(128, return_sequences=True))(inp)
-    res = x
-    x = tf.keras.layers.Bidirectional(tf.keras.layers.LSTM(128, return_sequences=True))(x)
-    x = tf.keras.layers.Add()([x, res])
-    x = tf.keras.layers.TimeDistributed(tf.keras.layers.Dense(64, activation='relu'))(x)
-    return tf.keras.Model(inp, x)
 
-# -------------------------------------------------------
-# 4) Simple Seq2Seq Decoder (example)
-# -------------------------------------------------------
-def build_seq2seq_decoder():
-    decoder_in = tf.keras.Input(shape=(None, 64))
-    x = tf.keras.layers.LSTM(64, return_sequences=True)(decoder_in)
-    out = tf.keras.layers.TimeDistributed(tf.keras.layers.Dense(30, activation='softmax'))(x)
-    return tf.keras.Model(decoder_in, out)
+# ---------- Fallback Models ----------
+class FallbackEncoder:
+    def __init__(self, seq_len=64, features_out=64):
+        self.seq_len = seq_len
+        self.features_out = features_out
 
-# -------------------------------------------------------
-# 5) XAI (SHAP)
-# -------------------------------------------------------
-def explain_model(model, sample):
-    explainer = shap.DeepExplainer(model, np.expand_dims(sample, 0))
-    shap_values = explainer.shap_values(np.expand_dims(sample, 0))
-    return shap_values
+    def predict(self, x):
+        x = x[0]  # remove batch
+        ts, ch = x.shape
 
-# -------------------------------------------------------
-# 6) Agentic AI (LLM reasoning layer)
-# -------------------------------------------------------
-def agentic_interpretation(text):
-    import google.generativeai as genai
-    genai.configure(api_key="AIzaSyAtX1QJdv-y5xasT3elZ-fqQiPZUT8kwpY")
+        if ts < self.seq_len:
+            pad = np.zeros((self.seq_len - ts, ch), dtype=np.float32)
+            x = np.vstack([x, pad])
+            ts = self.seq_len
 
-    model = genai.GenerativeModel("gemini-2.5-flash")
-    response = model.generate_content(
-        f"""You are an agentic AI. 
-        Given this EEG decoded output: {text}
-        - Interpret the meaning
-        - Detect anomalies
-        - Suggest improvements
-        - Self-correct if inconsistencies exist"""
-    )
-    return response.text
+        idx = np.linspace(0, ts - 1, self.seq_len).astype(int)
+        seq = x[idx, :]
 
-# -------------------------------------------------------
-# 7) PIPELINE EXECUTION
-# -------------------------------------------------------
+        rng = np.random.RandomState(42)
+        W = rng.randn(ch, self.features_out).astype(np.float32)
+        encoded = seq @ W
+
+        return encoded[None, ...]
+
+
+class FallbackDecoder:
+    def __init__(self, vocab_size=30):
+        self.vocab_size = vocab_size
+
+    def predict(self, encoded):
+        rng = np.random.RandomState(123)
+        W = rng.randn(encoded.shape[2], self.vocab_size).astype(np.float32)
+        logits = encoded @ W
+
+        e = np.exp(logits - logits.max(axis=-1, keepdims=True))
+        probs = e / (e.sum(axis=-1, keepdims=True) + 1e-9)
+        return probs
+
+
+# ---------- ONNX Inference ----------
+def run_onnx(model_path, arr):
+    sess = ort.InferenceSession(model_path, providers=["CPUExecutionProvider"])
+    inp = sess.get_inputs()[0].name
+    out = sess.run(None, {inp: arr.astype(np.float32)})
+    return out[0]
+
+
+# ============================================================
+# MAIN UI
+# ============================================================
+uploaded = st.file_uploader("Upload EEG (.edf)", type=["edf"])
+
 if uploaded:
-    st.subheader("📥 Reading EEG File...")
-    raw = mne.io.read_raw_edf(BytesIO(uploaded.read()), preload=True)
-    eeg_data = raw.get_data()
-    sfreq = raw.info['sfreq']
-    st.success("EEG Loaded Successfully")
+    st.info("Reading EEG... Please wait.")
+    eeg_data, sfreq, ch_names = read_edf_bytes(uploaded.read())
+    st.success(f"Loaded {eeg_data.shape[0]} channels, {eeg_data.shape[1]} samples @ {sfreq} Hz")
 
-    st.subheader("📊 Computing Power Spectral Density (PSD)...")
+    # PSD
+    st.subheader("📊 Power Spectral Density")
     psd, freqs = compute_psd(eeg_data, sfreq)
-    st.line_chart(psd[0][:200])
 
-    # reshape for model
-    psd_input = rearrange(psd, "c f -> f c")[None, :, :]
+    fig, ax = plt.subplots(figsize=(8, 3))
+    for i in range(min(4, psd.shape[0])):
+        ax.semilogy(freqs, psd[i], label=ch_names[i])
+    ax.legend(fontsize="small")
+    st.pyplot(fig)
 
-    st.subheader("🧠 Running Residual BiLSTM Encoder...")
-    encoder = build_residual_bilstm((psd_input.shape[1], psd_input.shape[2]))
-    encoded_features = encoder.predict(psd_input)
-    st.success("Residual BiLSTM encoding completed")
+    # Prepare model input
+    psd_T = psd.T  # (freqs × channels)
+    psd_T = (psd_T - psd_T.mean()) / (psd_T.std() + 1e-9)
+    model_input = psd_T[None, ...].astype(np.float32)
 
-    st.subheader("🔁 Running Seq2Seq Decoder...")
-    decoder = build_seq2seq_decoder()
-    decoded_output = decoder.predict(encoded_features)
-    predicted_tokens = np.argmax(decoded_output[0], axis=-1)
-    st.write("Decoded sequence:", predicted_tokens)
+    st.write("Model input shape:", model_input.shape)
 
-    st.subheader("🪄 Explainability (XAI)")
-    if st.button("Generate SHAP Explanation"):
-        shap_values = explain_model(encoder, psd_input[0])
-        st.write("SHAP Explanation Generated")
+    encoder_present = os.path.exists("encoder.onnx")
+    decoder_present = os.path.exists("decoder.onnx")
 
-        fig, ax = plt.subplots()
-        shap.summary_plot(shap_values[0], psd_input[0], show=False)
-        st.pyplot(fig)
+    # ============================================================
+    #  ONNX or fallback
+    # ============================================================
+    if encoder_present and decoder_present:
+        st.success("Found ONNX models — running ONNX inference.")
+        try:
+            encoded = run_onnx("encoder.onnx", model_input)
+            decoded = run_onnx("decoder.onnx", encoded)
+        except Exception as e:
+            st.error("ONNX inference failed, switching to fallback: " + str(e))
+            encoder_present = decoder_present = False
 
+    if not (encoder_present and decoder_present):
+        st.warning("Using fallback encoder/decoder (demo mode)")
+        encoder = FallbackEncoder()
+        encoded = encoder.predict(model_input)
+        decoder = FallbackDecoder(vocab_size=30)
+        decoded = decoder.predict(encoded)
+
+    # Token predictions
+    tokens = np.argmax(decoded, axis=-1)[0]
+    st.subheader("🔡 Decoded Tokens (First 40)")
+    st.write(tokens[:40].tolist())
+
+    # Channel importance
+    st.subheader("📌 Channel Importance (Simple)")
+    bands = {"delta": (0.5, 4), "theta": (4, 8), "alpha": (8, 12), "beta": (12, 30), "gamma": (30, 45)}
+    importance = np.zeros(psd.shape[0])
+
+    for (low, high) in bands.values():
+        idx = np.where((freqs >= low) & (freqs <= high))[0]
+        if len(idx) > 0:
+            importance += psd[:, idx].mean(axis=1)
+
+    importance /= importance.sum()
+    st.bar_chart(importance)
+    st.json({ch_names[i]: float(importance[i]) for i in range(len(ch_names))})
+
+    # ============================================================
+    #  Agentic LLM Interpretation
+    # ============================================================
     st.subheader("🤖 Agentic AI Interpretation")
-    if st.button("Interpret with Agentic AI"):
-        explanation = agentic_interpretation(str(predicted_tokens))
-        st.write(explanation)
 
+    if HAS_GENAI:
+        if st.button("Run Agentic Interpretation"):
+            try:
+                genai.configure(api_key=API_KEY)
+
+                prompt = f"""
+                You are an expert EEG interpreter. Based on token sequence and channel importance,
+                explain brain-state meaning, anomalies, and recommendations.
+
+                Tokens: {tokens[:40].tolist()}
+                Channel importance: { {ch_names[i]: float(importance[i]) for i in range(len(ch_names))} }
+                """
+
+                model = genai.GenerativeModel("gemini-2.5-flash")
+                resp = model.generate_content(prompt)
+                st.write(resp.text)
+
+            except Exception as e:
+                st.error("Agentic AI failed: " + str(e))
+    else:
+        st.info("google-generativeai not installed — agentic AI disabled.")
+
+else:
+    st.info("Upload an EEG .edf file to begin.")
