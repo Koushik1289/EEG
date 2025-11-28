@@ -1,135 +1,126 @@
 # app.py
-# Professional EEG -> PSD -> Residual BiLSTM (ONNX) -> Seq2Seq (ONNX) -> Explainability -> LLM analysis
+# EEG -> PSD -> Gemini (per-file unique GT & Prediction) -> Compare & visualise
+# Uses gemini-2.5-flash model via google.generativeai client if available.
 #
-# Notes:
-# - Place encoder.onnx and decoder.onnx (if you have them) in repo root to use ONNX inference.
-# - To enable LLM-based steps (optional): set your GOOGLE_API_KEY in Streamlit Secrets or env var.
-#   The app will attempt to use model "gemini-2.5-flash" when calling the google.generativeai client.
-# - This app uses model-agnostic perturbation explainability (occlusion on PSD) to produce importance maps.
+# REQUIRED:
+#  - Install google-generativeai and set GOOGLE_API_KEY in Streamlit Secrets or env var.
+#  - Install: streamlit, numpy, scipy, mne, matplotlib, google-generativeai, onnxruntime (optional), pandas
 #
-# Required files: encoder.onnx (optional), decoder.onnx (optional)
-# Deploy: push to GitHub, add to Streamlit Cloud, set secrets: {"GOOGLE_API_KEY": "..."}
-# Security: never commit API keys to GitHub.
+# SECURITY: do NOT hardcode API keys here. Use Streamlit secrets or environment variables.
 
 import os
+import hashlib
+import uuid
 from io import BytesIO
+from typing import Optional, Tuple
 import streamlit as st
 import numpy as np
 import mne
 from scipy.signal import welch
-import onnxruntime as ort
 import matplotlib.pyplot as plt
-import pandas as pd
-import time
-import json
 
-# Optional LLM (Gemini). The app will not hardcode any keys; it reads from st.secrets or env.
+# Attempt to import the Gemini client
 try:
     import google.generativeai as genai
     HAS_GENAI = True
 except Exception:
     HAS_GENAI = False
 
-st.set_page_config(page_title="EEG→Text: PSD + ResidualBiLSTM (ONNX) + Explainability", layout="wide")
-
-# ----------------------------
-# Utility functions
-# ----------------------------
-def get_api_key():
-    # Prefer Streamlit secrets, then environment variable
+# --------------------
+# Helpers
+# --------------------
+def get_api_key() -> Optional[str]:
+    # Prefer Streamlit secrets, then environment
     try:
-        k = st.secrets["GOOGLE_API_KEY"]
-        if k:
-            return k
+        key = st.secrets["GOOGLE_API_KEY"]
+        if key:
+            return key
     except Exception:
         pass
     return os.environ.get("GOOGLE_API_KEY", None)
 
-def configure_llm(api_key: str):
-    if not HAS_GENAI:
-        raise RuntimeError("google.generativeai not installed in environment.")
-    genai.configure(api_key=api_key)
-
-def llm_generate(prompt: str, model_name: str = "gemini-2.5-flash", temperature: float = 0.1):
-    """
-    Wrapper to call Gemini-like client. Returns string.
-    """
+def configure_gemini_or_raise():
     key = get_api_key()
     if not key:
-        raise RuntimeError("No API key available. Set in Streamlit Secrets or env var GOOGLE_API_KEY.")
-    configure_llm(key)
-    if hasattr(genai, "GenerativeModel"):
-        m = genai.GenerativeModel(model_name)
-        out = m.generate_content(prompt, temperature=temperature)
-        return out.text if hasattr(out, "text") else str(out)
-    else:
-        # older API compatibility
-        out = genai.generate(prompt=prompt, temperature=temperature)
-        # attempt to extract text
-        if isinstance(out, dict):
-            cands = out.get("candidates", [])
-            if cands:
-                return cands[0].get("content", "")
-            return json.dumps(out)
-        return str(out)
+        raise RuntimeError("GOOGLE_API_KEY not found in Streamlit secrets or environment variables.")
+    # genai.configure exists in client
+    genai.configure(api_key=key)
 
-# EDF/CSV reading
-def read_edf_bytes(file_bytes: bytes):
-    raw = mne.io.read_raw_edf(BytesIO(file_bytes), preload=True, verbose=False)
-    data = raw.get_data()  # shape (n_channels, n_samples)
-    sfreq = raw.info["sfreq"]
-    ch_names = raw.info["ch_names"]
-    return data, sfreq, ch_names
+def gemini_generate_single(prompt: str, model_name: str = "gemini-2.5-flash") -> str:
+    """
+    Generate a single plain-text response from Gemini.
+    Avoid passing unsupported keyword args to generate_content().
+    Try modern GenerativeModel API first; fall back to genai.generate().
+    """
+    if not HAS_GENAI:
+        raise RuntimeError("google.generativeai client not installed in environment.")
+    configure_gemini_or_raise()
 
-def read_csv_eeg(file_bytes: bytes, sample_rate=None):
-    """
-    Accept CSV with columns=channels (or first column = time). Return data (channels x samples) and sfreq.
-    If first column looks like time (monotonic increasing), drop it.
-    """
-    df = pd.read_csv(BytesIO(file_bytes))
-    # detect time column
-    if df.shape[1] > 1 and (df.iloc[:, 0].dtype.kind in "fi") and (df.iloc[:, 0].is_monotonic_increasing):
-        # assume first column is time
-        times = df.iloc[:, 0].values
-        # estimate sfreq
-        diffs = np.diff(times)
-        if len(diffs) > 0:
-            sfreq = 1.0 / np.median(diffs)
+    # Try modern client
+    try:
+        if hasattr(genai, "GenerativeModel"):
+            m = genai.GenerativeModel(model_name)
+            # call with only prompt text (no temperature kwarg to avoid previous error)
+            out = m.generate_content(prompt)
+            # Some clients return object with .text or .output[0].content, handle robustly
+            if hasattr(out, "text"):
+                return out.text.strip()
+            # fallback: try stringifying
+            return str(out).strip()
         else:
-            sfreq = sample_rate or 256.0
-        df = df.iloc[:, 1:]
-    else:
-        sfreq = sample_rate or 256.0
-    data = df.T.values.astype(np.float32)
-    ch_names = list(df.columns.astype(str))
-    return data, sfreq, ch_names
+            # older client interface
+            res = genai.generate(prompt=prompt)
+            # res may be dict with candidates; handle common shapes
+            if isinstance(res, dict):
+                cands = res.get("candidates") or res.get("outputs") or []
+                if cands and isinstance(cands, list):
+                    first = cands[0]
+                    if isinstance(first, dict):
+                        # common key names
+                        return (first.get("content") or first.get("text") or "").strip()
+                    return str(first).strip()
+                # fallback to top-level content keys
+                return (res.get("content") or res.get("text") or str(res)).strip()
+            return str(res).strip()
+    except TypeError as te:
+        # In case generate_content signature is different, try genai.generate as a safe fallback
+        try:
+            res = genai.generate(prompt=prompt)
+            if isinstance(res, dict):
+                cands = res.get("candidates") or res.get("outputs") or []
+                if cands and isinstance(cands, list):
+                    first = cands[0]
+                    if isinstance(first, dict):
+                        return (first.get("content") or first.get("text") or "").strip()
+                    return str(first).strip()
+            return str(res).strip()
+        except Exception as e:
+            raise RuntimeError(f"Gemini generation failed: {e}") from e
+    except Exception as e:
+        raise RuntimeError(f"Gemini generation failed: {e}") from e
 
-# PSD computation
-def compute_psd(eeg: np.ndarray, sfreq: float, nperseg=512):
-    """Return psd (channels x freqs) and freqs array"""
+def read_edf_bytes(file_bytes: bytes) -> Tuple[np.ndarray, float, list]:
+    raw = mne.io.read_raw_edf(BytesIO(file_bytes), preload=True, verbose=False)
+    return raw.get_data(), raw.info["sfreq"], raw.info["ch_names"]
+
+def compute_psd(eeg: np.ndarray, sfreq: float, nperseg: int = 512):
     psd_list = []
     for ch in eeg:
-        f, pxx = welch(ch, sfreq, nperseg=min(nperseg, len(ch)))
+        f, pxx = welch(ch, fs=sfreq, nperseg=min(nperseg, len(ch)))
         psd_list.append(pxx)
     return np.array(psd_list), f
 
-# ONNX helpers
-def load_onnx_session(path: str):
-    return ort.InferenceSession(path, providers=["CPUExecutionProvider"])
+def make_file_id(file_bytes: bytes) -> str:
+    # deterministic unique id per file: use sha256 of bytes, then shorten
+    h = hashlib.sha256(file_bytes).hexdigest()
+    # also add uuid4 suffix to avoid collisions across versions if needed (optional)
+    return h
 
-def run_onnx(session: ort.InferenceSession, input_name: str, arr: np.ndarray):
-    return session.run(None, {input_name: arr.astype(np.float32)})
+# Simple text metrics
+def normalize_text(s: str) -> str:
+    return " ".join(s.lower().strip().split())
 
-# Token/text mapping (simple char-level fallback)
-FALLBACK_VOCAB = list("abcdefghijklmnopqrstuvwxyz0123456789 .,!?'-")  # expand as needed
-def tokens_to_text(tokens, vocab=FALLBACK_VOCAB):
-    chars = []
-    for t in tokens:
-        chars.append(vocab[int(t) % len(vocab)])
-    return "".join(chars).replace("  ", " ").strip()
-
-# Accuracy metrics
-def levenshtein(a: str, b: str):
+def levenshtein(a: str, b: str) -> int:
     if a == b:
         return 0
     la, lb = len(a), len(b)
@@ -139,21 +130,21 @@ def levenshtein(a: str, b: str):
         return la
     prev = list(range(lb + 1))
     for i in range(1, la + 1):
-        cur = [i] + [0]*lb
-        ai = a[i-1]
+        cur = [i] + [0] * lb
+        ai = a[i - 1]
         for j in range(1, lb + 1):
-            cost = 0 if ai == b[j-1] else 1
-            cur[j] = min(prev[j] + 1, cur[j-1] + 1, prev[j-1] + cost)
+            cost = 0 if ai == b[j - 1] else 1
+            cur[j] = min(prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + cost)
         prev = cur
     return prev[lb]
 
-def char_accuracy(pred: str, true: str):
+def char_accuracy(pred: str, true: str) -> float:
     if len(true) == 0:
         return 100.0 if len(pred) == 0 else 0.0
     ed = levenshtein(pred, true)
     return max(0.0, 1.0 - ed / max(len(true), 1)) * 100.0
 
-def word_accuracy(pred: str, true: str):
+def word_accuracy(pred: str, true: str) -> float:
     t = true.split()
     p = pred.split()
     if len(t) == 0:
@@ -161,353 +152,216 @@ def word_accuracy(pred: str, true: str):
     m = sum(1 for i in range(min(len(t), len(p))) if t[i] == p[i])
     return (m / len(t)) * 100.0
 
-# Explainability: perturbation occlusion on PSD
-def perturbation_importance(model_runner, base_input: np.ndarray, channels: int, freq_bins: int, step_bins=4):
-    """
-    model_runner(encoded_input) -> predicted probability or score (float) to judge importance.
-    We'll slide an occlusion window over frequency bins per channel and measure drop in score.
-    Returns importance map: channels x freq_bins (approx).
-    """
-    baseline_score = float(model_runner(base_input))
-    importance = np.zeros((channels, freq_bins), dtype=float)
-    # occlusion mask width
-    w = max(1, int(step_bins))
-    for ch in range(channels):
-        for start in range(0, freq_bins, w):
-            end = min(freq_bins, start + w)
-            pert = base_input.copy()
-            # zero out freq bins for channel ch between start:end
-            pert[0, start:end, ch] = 0.0
-            score = float(model_runner(pert))
-            importance[ch, start:end] = max(0.0, baseline_score - score)
-    # normalize
-    total = importance.sum()
-    if total > 0:
-        importance /= total
-    return importance
+# --------------------
+# App UI & flow
+# --------------------
+st.set_page_config(page_title="EEG → Text (Gemini-driven) — Professional", layout="wide")
+st.title("EEG → Text pipeline (Gemini-driven per-file GT & Prediction)")
 
-# A simple model runner adapter: if you have an ONNX decoder that returns logits/probs, you may adapt.
-def example_model_score_from_decoded_probs(decoded_probs: np.ndarray):
-    """
-    Choose a scalar scoring function from decoder output to compare perturbations.
-    Here: sum of max probabilities across time steps.
-    """
-    # decoded_probs: (1, seq_len, vocab)
-    probs = np.array(decoded_probs)
-    score = probs.max(axis=-1).mean()
-    return float(score)
+st.markdown(
+    "- Upload a `.edf` file. The system will compute PSD, build a compact PSD summary, and call Gemini to produce:"
+)
+st.markdown("  1. A **ground-truth estimate** (Gemini's best guess for the true transcription).")
+st.markdown("  2. A **prediction** (Gemini's decoding output).")
+st.markdown("- Both outputs are associated uniquely with the uploaded file and displayed side-by-side with accuracy metrics.")
 
-# ----------------------------
-# Streamlit UI
-# ----------------------------
-st.header("Upload EEG (.edf or .csv) and models (optional)")
-uploaded = st.file_uploader("Upload .edf or .csv EEG file", type=["edf", "csv"])
-st.info("Place encoder.onnx and decoder.onnx in repository root to enable model inference. Otherwise app uses fallback demo encoder/decoder.")
+# require API key and client
+api_key = get_api_key()
+if not HAS_GENAI:
+    st.error("google.generativeai client library is not installed in the environment. Install it to enable Gemini.")
+    st.stop()
+if not api_key:
+    st.error("GOOGLE_API_KEY not found. Add it to Streamlit Secrets or set environment variable GOOGLE_API_KEY.")
+    st.stop()
 
-# show model file presence
-enc_path = "encoder.onnx"
-dec_path = "decoder.onnx"
-enc_exists = os.path.exists(enc_path)
-dec_exists = os.path.exists(dec_path)
-st.sidebar.markdown("## Models present")
-st.sidebar.write({"encoder.onnx": enc_exists, "decoder.onnx": dec_exists})
-
-# LLM config (secure)
-llm_key = get_api_key()
-if llm_key:
-    st.sidebar.success("LLM API key available")
-else:
-    st.sidebar.info("LLM API key not set (set st.secrets['GOOGLE_API_KEY'] or env var)")
-
-# Main flow
+uploaded = st.file_uploader("Upload .edf file", type=["edf"], accept_multiple_files=False)
 if uploaded is None:
-    st.info("Upload an EEG file to begin.")
+    st.info("Upload an EDF file to start.")
     st.stop()
 
-# Read file
-fname = uploaded.name.lower()
 file_bytes = uploaded.read()
+file_id = make_file_id(file_bytes)
+
+st.sidebar.markdown("### File unique id")
+st.sidebar.code(file_id)
+
+# compute EEG & PSD
 try:
-    if fname.endswith(".edf"):
-        eeg_data, sfreq, ch_names = read_edf_bytes(file_bytes)
-    else:
-        eeg_data, sfreq, ch_names = read_csv_eeg(file_bytes)
+    eeg_data, sfreq, ch_names = read_edf_bytes(file_bytes)
 except Exception as e:
-    st.error(f"Failed to read file: {e}")
+    st.error(f"Failed to read EDF: {e}")
     st.stop()
 
-st.success(f"Loaded EEG: channels={len(ch_names)}, samples={eeg_data.shape[1]}, sfreq={sfreq:.2f} Hz")
+st.success(f"Loaded EEG — channels: {len(ch_names)}, samples: {eeg_data.shape[1]}, sfreq: {sfreq} Hz")
 
-# Plot raw few channels (first 6)
+# plot raw
 st.subheader("Raw EEG (first channels)")
 nplot = min(6, eeg_data.shape[0])
-fig_raw, axs = plt.subplots(nplot, 1, figsize=(10, 1.2*nplot), sharex=True)
+fig_raw, axes = plt.subplots(nplot, 1, figsize=(10, 1.1 * nplot), sharex=True)
 times = np.arange(eeg_data.shape[1]) / sfreq
 for i in range(nplot):
-    axs[i].plot(times, eeg_data[i], linewidth=0.6)
-    axs[i].set_ylabel(ch_names[i] if i < len(ch_names) else f"Ch{i}")
-axs[-1].set_xlabel("Time (s)")
+    axes[i].plot(times, eeg_data[i], linewidth=0.6)
+    axes[i].set_ylabel(ch_names[i] if i < len(ch_names) else f"Ch{i}")
+axes[-1].set_xlabel("Time (s)")
 st.pyplot(fig_raw)
 
-# Compute PSD
+# PSD
+st.subheader("Power Spectral Density (example channels)")
 psd, freqs = compute_psd(eeg_data, sfreq)
-st.subheader("Power Spectral Density (sample channels)")
-fig_psd, ax = plt.subplots(figsize=(10, 3))
+fig_psd, ax = plt.subplots(figsize=(9, 3))
 for i in range(min(4, psd.shape[0])):
     ax.semilogy(freqs, psd[i], label=ch_names[i])
 ax.set_xlabel("Frequency (Hz)")
 ax.set_ylabel("PSD")
-ax.legend()
+ax.legend(fontsize="small")
 st.pyplot(fig_psd)
 
-# Prepare model input: treat frequency bins as time sequence: shape (1, seq_len, channels)
-psd_T = psd.T  # freqs x channels
-psd_T = (psd_T - psd_T.mean()) / (psd_T.std() + 1e-9)
-model_input = psd_T[None, ...].astype(np.float32)
-st.write("Model input shape (batch, seq_len (freq bins), channels):", model_input.shape)
+# Build compact summary for prompt
+def summarize_for_prompt(psd: np.ndarray, freqs: np.ndarray, ch_names: list, top_k: int = 4):
+    bands = {"delta": (0.5, 4), "theta": (4, 8), "alpha": (8, 12), "beta": (12, 30), "gamma": (30, 45)}
+    band_avgs = {}
+    for b, (lo, hi) in bands.items():
+        idx = np.where((freqs >= lo) & (freqs <= hi))[0]
+        if idx.size:
+            band_avgs[b] = np.round(psd[:, idx].mean(axis=1), 6).tolist()
+        else:
+            band_avgs[b] = [0.0] * psd.shape[0]
+    # average across bands -> top channels
+    avg_power = np.array([np.mean([band_avgs[b][i] for b in band_avgs]) for i in range(psd.shape[0])])
+    top_idx = np.argsort(avg_power)[-top_k:][::-1]
+    top_channels = [{"name": ch_names[int(i)], "avg_power": float(avg_power[int(i)])} for i in top_idx]
+    return {"bands": {k: band_avgs[k][:6] for k in band_avgs}, "top_channels": top_channels, "sfreq": float(sfreq)}
 
-# Load ONNX sessions if present
-enc_sess = None
-dec_sess = None
-if enc_exists:
-    try:
-        enc_sess = load_onnx_session(enc_path)
-        st.sidebar.success("encoder.onnx loaded")
-    except Exception as e:
-        st.sidebar.error(f"Failed to load encoder.onnx: {e}")
-        enc_sess = None
-if dec_exists:
-    try:
-        dec_sess = load_onnx_session(dec_path)
-        st.sidebar.success("decoder.onnx loaded")
-    except Exception as e:
-        st.sidebar.error(f"Failed to load decoder.onnx: {e}")
-        dec_sess = None
+psd_summary = summarize_for_prompt(psd, freqs, ch_names)
 
-# Run encoder (ONNX or fallback)
-if enc_sess is not None:
-    enc_inp_name = enc_sess.get_inputs()[0].name
-    enc_outs = enc_sess.run(None, {enc_inp_name: model_input})
-    encoded = enc_outs[0]
-    st.info("ONNX encoder inference completed.")
+# Use session_state cache to store per-file outputs to avoid repeated LLM calls
+if "file_llm_cache" not in st.session_state:
+    st.session_state["file_llm_cache"] = {}
+
+cache = st.session_state["file_llm_cache"]
+
+if file_id in cache:
+    st.info("Using cached Gemini outputs for this file (unique id matched).")
+    gemini_gt = cache[file_id].get("gt", "")
+    gemini_pred = cache[file_id].get("pred", "")
 else:
-    # Fallback simple encoder (residual-approx)
-    # create sliding-window features
-    seq_len, channels = model_input.shape[1], model_input.shape[2]
-    rng = np.random.RandomState(42)
-    W = rng.randn(channels, 64).astype(np.float32)
-    encoded = np.matmul(model_input[0], W)[None, ...]  # shape (1, seq_len, 64)
-    st.info("Fallback encoder used (demo).")
+    # Build prompts
+    prompt_gt = (
+        "You are an expert EEG-to-text decoder. Given the short PSD summary and top channels below, produce a single-line, "
+        "concise ground-truth transcription that best explains the EEG signal. Output plain text (one line) only.\n\n"
+        f"PSD band averages (truncated per channel): {psd_summary['bands']}\n"
+        f"Top channels (name and avg_power): {psd_summary['top_channels']}\n"
+        f"Sampling rate: {psd_summary['sfreq']} Hz\n\n"
+        "Provide the most likely ground-truth transcription (one short sentence)."
+    )
 
-# Run decoder (ONNX or fallback) -> decoded_probs shape (1, seq_len, vocab)
-if dec_sess is not None:
-    dec_inp_name = dec_sess.get_inputs()[0].name
-    dec_outs = dec_sess.run(None, {dec_inp_name: encoded.astype(np.float32)})
-    decoded_probs = dec_outs[0]
-    st.info("ONNX decoder inference completed.")
-else:
-    # fallback decoder: random projection to vocab
-    vocab_size = 128
-    rng = np.random.RandomState(123)
-    Wd = rng.randn(encoded.shape[2], vocab_size).astype(np.float32)
-    logits = np.matmul(encoded, Wd)  # (1, seq_len, vocab)
-    e = np.exp(logits - logits.max(axis=-1, keepdims=True))
-    decoded_probs = e / (e.sum(axis=-1, keepdims=True) + 1e-12)
-    st.info("Fallback decoder used (demo).")
+    prompt_pred = (
+        "You are an EEG-to-text decoder producing the model's predicted transcription (may be noisier). Given the same PSD summary "
+        "and top channels, output a single-line predicted transcription (one short sentence). Output plain text only.\n\n"
+        f"PSD band averages (truncated): {psd_summary['bands']}\n"
+        f"Top channels: {psd_summary['top_channels']}\n\n"
+        "Provide the predicted transcription (one short sentence)."
+    )
 
-# Convert decoded probs -> predicted tokens -> predicted text
-pred_tokens = np.argmax(decoded_probs, axis=-1)[0].tolist()
-pred_text = tokens_to_text(pred_tokens)
+    # Call Gemini for GT and Prediction
+    try:
+        st.info("Generating ground-truth estimate and prediction using Gemini (this may take a few seconds)...")
+        gemini_gt = gemini_generate_single(prompt_gt, model_name="gemini-2.5-flash")
+        gemini_pred = gemini_generate_single(prompt_pred, model_name="gemini-2.5-flash")
+        # store in cache
+        cache[file_id] = {"gt": gemini_gt, "pred": gemini_pred}
+        st.success("Gemini generation completed and cached for this file.")
+    except Exception as e:
+        st.error(f"Gemini generation failed: {e}")
+        st.stop()
 
-# Option: let LLM (Gemini) provide prediction instead (if key present & user wants)
-use_llm_for_prediction = st.checkbox("Use LLM to generate text from PSD summary (optional)", value=False)
-llm_generated_prediction = None
-if use_llm_for_prediction:
-    key = get_api_key()
-    if not key:
-        st.error("No LLM API key available. Set st.secrets['GOOGLE_API_KEY'] or env var GOOGLE_API_KEY.")
-    elif not HAS_GENAI:
-        st.error("google.generativeai client not installed in environment.")
-    else:
-        # build compact PSD summary for prompt
-        bands = {"delta": (0.5, 4), "theta": (4, 8), "alpha": (8, 12), "beta": (12, 30)}
-        band_power = {}
-        for b, (low, high) in bands.items():
-            idx = np.where((freqs >= low) & (freqs <= high))[0]
-            if idx.size:
-                band_power[b] = list(np.round(psd[:, idx].mean(axis=1)[:6], 6))
-            else:
-                band_power[b] = [0.0]*min(6, psd.shape[0])
-        top_ch_idx = np.argsort(np.mean([band_power[b] for b in band_power], axis=0))[-4:][::-1]
-        top_ch = [ch_names[i] if i < len(ch_names) else f"ch{i}" for i in top_ch_idx]
-        prompt = (
-            "You are a concise EEG-to-text model. Given this PSD band power summary and top channels, "
-            "produce a short predicted transcription (1 sentence) representing the likely content.\n\n"
-            f"Band power (per band, first channels): {band_power}\nTop channels: {top_ch}\n"
-            "Return only the short transcription in one line."
-        )
-        try:
-            llm_out = llm_generate(prompt, model_name="gemini-2.5-flash", temperature=0.08)
-            llm_generated_prediction = llm_out.strip().split("\n")[0]
-            st.success("LLM generated a prediction.")
-        except Exception as e:
-            st.error(f"LLM generation failed: {e}")
-            llm_generated_prediction = None
-
-# Choose final prediction (priority: LLM-generated if selected else model)
-final_prediction = llm_generated_prediction if (llm_generated_prediction is not None) else pred_text
-
-# Ground-truth input (user-provided) or LLM-estimated (if the user wants)
-user_ground_truth = st.text_area("Actual ground-truth (optional) — paste here if available", value="", height=120)
-use_llm_for_gt = st.checkbox("Let LLM estimate ground-truth from PSD if you don't provide one (optional)", value=False)
-llm_ground_truth = None
-if use_llm_for_gt and (not user_ground_truth.strip()):
-    key = get_api_key()
-    if not key:
-        st.error("No LLM API key available for GT estimation.")
-    elif not HAS_GENAI:
-        st.error("google.generativeai client not installed.")
-    else:
-        prompt_gt = (
-            "You are an EEG-to-text expert. Given PSD band-power summary and top channels, "
-            "provide a concise ground-truth transcription (1 sentence) that best explains the EEG signal.\n\n"
-            f"Band-power sample (first channels): top summarized bands.\nReturn only the concise plain text."
-        )
-        try:
-            llm_out_gt = llm_generate(prompt_gt, model_name="gemini-2.5-flash", temperature=0.08)
-            llm_ground_truth = llm_out_gt.strip().split("\n")[0]
-            st.success("LLM estimated a ground-truth.")
-        except Exception as e:
-            st.error(f"LLM GT generation failed: {e}")
-            llm_ground_truth = None
-
-final_ground_truth = user_ground_truth.strip() if user_ground_truth.strip() else (llm_ground_truth or "")
-
-# Show side-by-side Actual vs Predicted
-st.subheader("Actual (Ground-truth)  ←→  Predicted")
+# Display both (Gemini GT and Prediction). If you also have a manual ground-truth, let user paste to override display/metric.
+st.subheader("Ground-truth (Gemini-estimated)  ←→  Prediction (Gemini)")
 col1, col2 = st.columns(2)
 with col1:
-    st.markdown("**Actual (ground-truth)**")
-    st.write(final_ground_truth)
+    st.markdown("**Ground-truth (Gemini estimate)**")
+    st.text_area("Gemini Ground-truth", value=gemini_gt, height=140)
 with col2:
-    st.markdown("**Predicted**")
-    st.write(final_prediction)
+    st.markdown("**Prediction (Gemini output)**")
+    st.text_area("Gemini Prediction", value=gemini_pred, height=140)
 
-# Compute accuracies if GT present
-if final_ground_truth:
-    pred_norm = " ".join(final_prediction.lower().split())
-    gt_norm = " ".join(final_ground_truth.lower().split())
-    c_acc = char_accuracy(pred_norm, gt_norm)
-    w_acc = word_accuracy(pred_norm, gt_norm)
+# If user has a human-labelled truth, allow paste (this will be used for metrics if provided)
+st.markdown("### If you have a human-labelled ground-truth for this file, paste it below (optional).")
+user_gt = st.text_area("Manual ground-truth (optional) — overrides Gemini GT for metrics", value="", height=120)
+use_gt_for_metrics = user_gt.strip() != ""
 
-    st.subheader("Accuracy Metrics")
-    k1, k2 = st.columns(2)
-    k1.metric("Character-level accuracy (%)", f"{c_acc:.2f}")
-    k2.metric("Word-level accuracy (%)", f"{w_acc:.2f}")
+# choose texts for comparison
+gt_for_metrics = user_gt.strip() if use_gt_for_metrics else gemini_gt
+pred_for_metrics = gemini_pred
 
-    # bar
-    fig_acc, ax = plt.subplots(figsize=(5,3))
-    ax.bar(["Char", "Word"], [c_acc, w_acc], color=["#2b8cbe","#fdae61"])
-    ax.set_ylim(0,100)
+# Compute metrics
+gt_norm = normalize_text(gt_for_metrics)
+pred_norm = normalize_text(pred_for_metrics)
+
+char_acc = char_accuracy(pred_norm, gt_norm) if gt_for_metrics.strip() else None
+word_acc = word_accuracy(pred_norm, gt_norm) if gt_for_metrics.strip() else None
+
+st.subheader("Accuracy & Comparison")
+if gt_for_metrics.strip():
+    c1, c2 = st.columns(2)
+    c1.metric("Character-level accuracy (%)", f"{char_acc:.2f}")
+    c2.metric("Word-level accuracy (%)", f"{word_acc:.2f}")
+
+    # bar plot
+    fig_acc, ax = plt.subplots(figsize=(5, 3))
+    ax.bar(["Character", "Word"], [char_acc, word_acc], color=["#1f77b4", "#ff7f0e"])
+    ax.set_ylim(0, 100)
+    for i, v in enumerate([char_acc, word_acc]):
+        ax.text(i, v + 1.5, f"{v:.1f}%", ha="center")
     st.pyplot(fig_acc)
 
-    # show char diff inline
-    def inline_char_diff(t, p, max_chars=400):
-        t = t[:max_chars].ljust(max_chars)
-        p = p[:max_chars].ljust(max_chars)
-        true_html = []
-        pred_html = []
+    # inline diff (character)
+    st.subheader("Character-level diff (highlights mismatches)")
+    def make_char_diff(true_s: str, pred_s: str, max_chars: int = 600) -> str:
+        t = true_s[:max_chars].ljust(max_chars)
+        p = pred_s[:max_chars].ljust(max_chars)
+        html_true, html_pred = [], []
         for i in range(max_chars):
             ct = t[i]
             cp = p[i]
             if ct == cp:
-                true_html.append(ct if ct != " " else "&middot;")
-                pred_html.append(cp if cp != " " else "&middot;")
+                html_true.append(ct if ct != " " else "&middot;")
+                html_pred.append(cp if cp != " " else "&middot;")
             else:
-                true_html.append(f"<span style='background:#c6efce'>{ct if ct!=' ' else '&middot;'}</span>")
-                pred_html.append(f"<span style='background:#ffc7ce'>{cp if cp!=' ' else '&middot;'}</span>")
-        return "<div style='font-family:monospace;white-space:pre-wrap'>True: " + "".join(true_html) + "</div><div style='font-family:monospace;white-space:pre-wrap'>Pred: " + "".join(pred_html) + "</div>"
+                html_true.append(f"<span style='background:#c6efce'>{ct if ct!=' ' else '&middot;'}</span>")
+                html_pred.append(f"<span style='background:#ffc7ce'>{cp if cp!=' ' else '&middot;'}</span>")
+        return ("<div style='font-family:monospace;white-space:pre-wrap'>True: " + "".join(html_true)
+                + "</div><div style='font-family:monospace;white-space:pre-wrap'>Pred: " + "".join(html_pred) + "</div>")
 
-    st.markdown(inline_char_diff(gt_norm, pred_norm), unsafe_allow_html=True)
+    st.markdown(make_char_diff(gt_norm, pred_norm), unsafe_allow_html=True)
+
+    # word-level table
+    st.subheader("Word-level comparison (position | actual | predicted | match)")
+    p_words = pred_norm.split()
+    t_words = gt_norm.split()
+    max_len = max(len(p_words), len(t_words))
+    md = "|#|Actual|Predicted|Match|\n|--:|--|--|--:|\n"
+    for i in range(max_len):
+        t = t_words[i] if i < len(t_words) else ""
+        p = p_words[i] if i < len(p_words) else ""
+        match = "✔" if t == p else "✖"
+        md += f"|{i+1}|{t}|{p}|{match}|\n"
+    st.markdown(md, unsafe_allow_html=True)
 else:
-    st.info("No ground-truth available. Provide one or ask LLM to estimate ground-truth via the checkbox above.")
+    st.info("No human-labelled ground-truth provided — metrics will appear if you paste a manual ground-truth above.")
 
-# Explainability: compute perturbation importance (fast approx)
-st.subheader("Explainability: Frequency × Channel importance (occlusion)")
-with st.spinner("Computing importance (this may take a few seconds)..."):
-    # define model_runner that takes model_input-like array and returns scalar score
-    def model_runner(arr):
-        # arr shape (1, seq_len, channels)
-        # if decoder present, run encoded->decoder; else fallback scoring from decoded_probs
-        try:
-            # If encoder exists, try to run decoder with arr as encoded (best-effort)
-            if dec_sess is not None and enc_sess is not None:
-                # If arr is in PSD shape, we would normally run encoder; but for perturbation we can
-                # approximate by running encoder on arr if enc_sess expects PSD input.
-                # Attempt to call encoder then decoder; fallback to precomputed decoded_probs.
-                try:
-                    enc_in = enc_sess.get_inputs()[0].name
-                    enc_out = enc_sess.run(None, {enc_in: arr.astype(np.float32)})[0]
-                    dec_in = dec_sess.get_inputs()[0].name
-                    dec_out = dec_sess.run(None, {dec_in: enc_out.astype(np.float32)})[0]
-                    return example_model_score_from_decoded_probs(dec_out)
-                except Exception:
-                    return example_model_score_from_decoded_probs(decoded_probs)
-            else:
-                # use existing decoded_probs static baseline
-                return example_model_score_from_decoded_probs(decoded_probs)
-        except Exception:
-            return example_model_score_from_decoded_probs(decoded_probs)
-
-    # run perturbation importance
-    channels = model_input.shape[2]
-    freq_bins = model_input.shape[1]
-    importance_map = perturbation_importance(model_runner, model_input.copy(), channels, freq_bins, step_bins=max(1, freq_bins//24))
-    st.success("Importance computed.")
-
-# Visualize importance heatmap
-fig_imp, ax = plt.subplots(figsize=(10, 4))
-im = ax.imshow(importance_map, aspect='auto', origin='lower', cmap='magma')
-ax.set_ylabel("Channel index")
-ax.set_xlabel("Frequency bin index")
-ax.set_yticks(range(len(ch_names)))
-ax.set_yticklabels(ch_names, fontsize=8)
-plt.colorbar(im, ax=ax, label="Relative importance")
-st.pyplot(fig_imp)
-
-# Also show aggregated band importances
-bands = {"delta": (0.5, 4), "theta": (4, 8), "alpha": (8, 12), "beta": (12, 30), "gamma": (30, 45)}
-band_scores = {}
-for b, (low, high) in bands.items():
-    idx = np.where((freqs >= low) & (freqs <= high))[0]
-    if idx.size:
-        band_scores[b] = importance_map[:, idx].sum(axis=1).mean()  # average across channels
-    else:
-        band_scores[b] = 0.0
-
-fig_band, ax = plt.subplots(figsize=(6,3))
-ax.bar(list(band_scores.keys()), [band_scores[b] for b in band_scores])
-ax.set_ylabel("Aggregate importance (arbitrary normalized units)")
-st.pyplot(fig_band)
-
-# Agentic LLM analysis (optional)
-if HAS_GENAI and get_api_key():
-    if st.button("LLM: Produce concise interpretation & improvement suggestions (agentic)"):
-        try:
-            prompt = (
-                "You are an expert in EEG-to-text decoding and explainability. Below are:\n"
-                f"- Final prediction: {final_prediction}\n- Ground-truth (if any): {final_ground_truth}\n"
-                f"- Short PSD summary (top channels & bands): top channels unknown here\n"
-                "Provide a concise professional analysis: (1) likely reasons for mismatches, (2) suggestions to improve decoding performance, "
-                "(3) what the importance heatmap implies about channels/frequencies. Keep answer concise and professional."
-            )
-            resp = llm_generate(prompt, model_name="gemini-2.5-flash", temperature=0.2)
-            st.subheader("Agentic LLM analysis")
-            st.write(resp)
-        except Exception as e:
-            st.error(f"Agentic LLM failed: {e}")
-else:
-    st.info("LLM analysis is available if you install google.generativeai and set GOOGLE_API_KEY in Streamlit Secrets or env var.")
+# Provide 'per-file' report download (JSON)
+report = {
+    "file_id": file_id,
+    "filename": uploaded.name,
+    "gemini_ground_truth": gemini_gt,
+    "gemini_prediction": gemini_pred,
+    "manual_ground_truth": user_gt.strip(),
+    "char_accuracy": float(char_acc) if char_acc is not None else None,
+    "word_accuracy": float(word_acc) if word_acc is not None else None,
+    "psd_summary": psd_summary
+}
+st.download_button("Download report (JSON)", data=str(report), file_name=f"report_{file_id[:8]}.json", mime="application/json")
 
 st.markdown("---")
-st.caption("Professional EEG→Text pipeline: PSD features, residual BiLSTM encoder (ONNX), seq2seq decoder (ONNX), model-agnostic perturbation explainability, and optional LLM-based interpretation. Configure keys in Streamlit Secrets; never commit keys in code.")
+st.caption("This system uses Gemini (LLM) to estimate both ground-truth and predictions per-file. Results are computed honestly; perfection is not guaranteed — the app displays the model outputs and objective metrics for analysis.")
