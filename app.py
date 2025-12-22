@@ -16,7 +16,7 @@ st.set_page_config(
 
 # --- 2. GEMINI API SETUP ---
 # NOTE: Using a placeholder key.
-GEMINI_API_KEY = "AIzaSyAtX1QJdv-y5xasT3elZ-fqQiPZUT8kwpY"
+GEMINI_API_KEY = "AIzaSyCWi3Q4m6HujP6XHMyWfpTPzb3Df2IcamA"
 
 try:
     # Initialize client globally for functions that cannot be cached (like the UI/button interaction)
