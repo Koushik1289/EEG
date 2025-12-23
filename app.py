@@ -3,7 +3,7 @@ import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 import plotly.express as px
-from google import genai
+from google.generativeai import genai
 from google.genai.errors import APIError
 import json
 
