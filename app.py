@@ -42,12 +42,38 @@ def get_deterministic_decoding_texts(file_name, api_key):
     Generates simulated Ground Truth and Predicted Text.
     @st.cache_data guarantees the same output for the same file_name across sessions.
     """
+    api_key = st.secrets.get("GEMINI_API_KEY")
     # Initialize client locally inside the cached function for thread safety and persistence
     try:
         local_client = genai.Client(api_key=api_key)
     except Exception:
         # Fallback if API key is invalid/fails
         return "The quick brown fox jumps over the lazy dog.", "The quik bown box jump over the lazy dod."
+# @st.cache_data(show_spinner=False)
+# def get_deterministic_decoding_texts(file_name):
+#     """
+#     Fetch API key inside or use a non-hashed argument to keep cache stable.
+#     """
+#     # Use the globally defined key or fetch directly
+#     api_key = st.secrets.get("GEMINI_API_KEY")
+    
+#     try:
+#         local_client = genai.Client(api_key=api_key)
+#         prompt = f"..." # your prompt here
+        
+#         # Note: 'gemini-2.5-flash' is a futuristic placeholder. 
+#         # Ensure you use 'gemini-2.0-flash' or 'gemini-1.5-flash' for current models.
+#         response = local_client.models.generate_content(
+#             model='gemini-2.0-flash', 
+#             contents=prompt,
+#             config=genai.types.GenerateContentConfig(
+#                 response_mime_type="application/json",
+#             )
+#         )
+#         result = json.loads(response.text)
+#         return result['actual_text'], result['predicted_text']
+#     except Exception:
+#         return "The quick brown fox...", "The quik bown box..."
 
     prompt = f"""
     You are simulating the deterministic results of a high-end EEG-to-Text decoding system for a file from a 34-subject dataset: '{file_name}'.
