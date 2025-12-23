@@ -15,14 +15,23 @@ st.set_page_config(
 )
 
 # --- 2. GEMINI API SETUP ---
-# NOTE: Using a placeholder key.
-GEMINI_API_KEY = "AIzaSyCWi3Q4m6HujP6XHMyWfpTPzb3Df2IcamA"
+# Retrieve the key from Streamlit secrets
+GEMINI_API_KEY = st.secrets.get("GEMINI_API_KEY")
 
-try:
-    # Initialize client globally for functions that cannot be cached (like the UI/button interaction)
-    client = genai.Client(api_key=GEMINI_API_KEY)
-except Exception:
-    client = None
+client = None
+
+if not GEMINI_API_KEY:
+    st.error("Missing Gemini API Key. Please configure it in Streamlit Secrets.")
+else:
+    try:
+        # Initialize client
+        genai.configure(api_key=GEMINI_API_KEY)
+        # Depending on the library version, you may use genai.GenerativeModel 
+        # or the client object as shown in your original snippet:
+        client = genai.Client(api_key=GEMINI_API_KEY)
+    except Exception as e:
+        st.error(f"Failed to initialize Gemini Client: {e}")
+        client = None
 
 
 # --- 3. CORE FUNCTIONS (WITH PERSISTENT CACHING) ---
