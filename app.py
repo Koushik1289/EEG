@@ -29,7 +29,7 @@ else:
         genai.configure(api_key=GEMINI_API_KEY)
         # Depending on the library version, you may use genai.GenerativeModel 
         # or the client object as shown in your original snippet:
-        client = genai.Client(api_key=GEMINI_API_KEY)
+        client = genai.GenerativeModel("gemini-2.5-flash")
     except Exception as e:
         st.error(f"Failed to initialize Gemini Client: {e}")
         client = None
@@ -46,7 +46,7 @@ def get_deterministic_decoding_texts(file_name, api_key):
     api_key = st.secrets.get("GEMINI_API_KEY")
     # Initialize client locally inside the cached function for thread safety and persistence
     try:
-        local_client = genai.Client(api_key=api_key)
+        local_client = genai.GenerativeModel("gemini-2.5-flash")
     except Exception:
         # Fallback if API key is invalid/fails
         return "The quick brown fox jumps over the lazy dog.", "The quik bown box jump over the lazy dod."
