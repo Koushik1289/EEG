@@ -1,0 +1,18 @@
+import numpy as np
+from scipy.signal import welch
+
+def extract_psd_features(signal, sfreq):
+    freqs, psd = welch(signal, fs=sfreq, nperseg=256)
+
+    d = np.mean(psd[(freqs>=0.5)&(freqs<4)])
+    t = np.mean(psd[(freqs>=4)&(freqs<8)])
+    a = np.mean(psd[(freqs>=8)&(freqs<13)])
+    b = np.mean(psd[(freqs>=13)&(freqs<30)])
+    g = np.mean(psd[(freqs>=30)&(freqs<40)])
+
+    tot = d+t+a+b+g+1e-8
+
+    return [
+        d,t,a,b,g,
+        d/tot,t/tot,a/tot,b/tot,g/tot
+    ]
