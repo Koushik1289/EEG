@@ -1,0 +1,13 @@
+import numpy as np
+from scipy.stats import skew, kurtosis
+
+def extract_time_features(signal):
+    return [
+        np.mean(signal),
+        np.std(signal),
+        np.var(signal),
+        np.max(signal) - np.min(signal),
+        np.sqrt(np.mean(signal ** 2)),
+        skew(signal),
+        kurtosis(signal)
+    ]
